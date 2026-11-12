@@ -1,0 +1,106 @@
+# =========================================================================
+#  Render Blueprint - https://render.com/docs/blueprint-spec
+#
+#  Two services:
+#    1. online-coding-judge  - the FastAPI API, built from the Dockerfile
+#    2. crucible-web         - the React frontend, as a static site
+#
+#  The API runs as a Docker image, but NOT with the Docker sandbox: Render's
+#  free tier exposes no Docker socket, so submissions run in the rlimit
+#  sandbox (EXECUTION_BACKEND=local) inside the container. The image is what
+#  carries the compilers: the native Python runtime had Python and g++ but
+#  no Java -- every Java submission failed -- and no Node, Go, Rust, Ruby or
+#  PHP. The Docker sandbox is still the real one: `docker compose up` locally.
+#
+#  DATABASE_URL is deliberately NOT defined here: set it in the Render
+#  dashboard so the credential never lands in version control.
+# =========================================================================
+
+services:
+  # ---------------------------------------------------------------- API --
+  - type: web
+    name: online-coding-judge
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+
+    # The Dockerfile's CMD starts uvicorn on $PORT, which Render sets.
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+
+    healthCheckPath: /api/v1/ping
+
+    envVars:
+      # ---- Set manually in the dashboard (marked sync:false) -------------
+      - key: DATABASE_URL
+        sync: false          # paste your Neon pooled connection string here
+      - key: ADMIN_EMAILS
+        sync: false          # the email you register with, to get admin
+
+      # ---- Generated once by Render and then held stable -----------------
+      - key: SECRET_KEY
+        generateValue: true
+
+      # ---- Runtime -------------------------------------------------------
+      - key: ENVIRONMENT
+        value: production
+      # The frontend is served from a different origin, so the browser sends
+      # a preflight on every write. Narrow this to the static site's URL once
+      # it is known, if you want to stop other origins using this API.
+      - key: CORS_ORIGINS
+        value: "*"
+
+      # ---- Execution engine ----------------------------------------------
+      # No Docker socket on Render, so the rlimit sandbox is the only option.
+      # Stated explicitly rather than letting `auto` fall back silently.
+      - key: EXECUTION_BACKEND
+        value: local
+      - key: EXECUTION_TIME_LIMIT_MS
+        value: "2000"
+      - key: EXECUTION_MEMORY_LIMIT_MB
+        value: "128"
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "1440"
+      # Practice coach. Free keys, no card: console.groq.com/keys and
+      # aistudio.google.com/apikey. Either or both; Render asks on first deploy.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+
+  # ----------------------------------------------------------- Frontend --
+  - type: web
+    name: crucible-web
+    runtime: static
+    # No `plan` key: Render static sites are always free and reject it.
+    branch: main
+    rootDir: frontend
+
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+
+    envVars:
+      # Vite inlines VITE_* variables at build time, so changing this requires
+      # a rebuild, not just a restart.
+      - key: VITE_API_BASE_URL
+        sync: false          # e.g. https://online-coding-judge-7w5q.onrender.com
+
+    routes:
+      # Single-page app: every unmatched path must return index.html so that
+      # deep links like /problems/two-sum work on a hard refresh.
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    headers:
+      # Vite emits content-hashed filenames, so assets can be cached forever.
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
